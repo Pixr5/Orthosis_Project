@@ -27,7 +27,7 @@
 #define LEDC_CHANNEL    LEDC_CHANNEL_0
 #define LEDC_DUTY_RES   LEDC_TIMER_10_BIT  // 10-bit resolution (0-1023) cant go any higher at 20kHz
 #define LEDC_FREQUENCY  200  // 200 Hz pwm frequency 
-#define SECURITY_MARGIN  50   // Safety margin for PWM duty cycle
+#define SECURITY_MARGIN  10   // Safety margin for remanant noise after low pass filter
 
 // Solenoid control pin
 #define SOLENOID_PIN    18
