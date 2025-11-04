@@ -26,14 +26,15 @@
 #define LEDC_MODE       LEDC_LOW_SPEED_MODE
 #define LEDC_CHANNEL    LEDC_CHANNEL_0
 #define LEDC_DUTY_RES   LEDC_TIMER_10_BIT  // 10-bit resolution (0-1023) cant go any higher at 20kHz
-#define LEDC_FREQUENCY  200  // 200 Hz to protect the TIP 125
+#define LEDC_FREQUENCY  200  // 200 Hz pwm frequency 
+#define SECURITY_MARGIN  50   // Safety margin for PWM duty cycle
 
 // Solenoid control pin
 #define SOLENOID_PIN    18
 
-#define ADC_INPUT_PIN   4
+#define ADC_INPUT_PIN   4 // GPIO4
 #define ADC_UNIT        ADC_UNIT_1
-#define ADC_CHANNEL     ADC_CHANNEL_4   // GPIO4
+#define ADC_CHANNEL     ADC_CHANNEL_4   
 #define ADC_ATTEN       ADC_ATTEN_DB_12
 
 // Motor control constants
@@ -68,6 +69,8 @@ static esp_ble_adv_params_t adv_params = {
     .adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
 };
 
+    // PID control parameters for later use
+
 // float kp = 0.25f;              // Proportional gain
 // float ki = 0.05f;              // Integral gain
 // float error_sum = 0.0f;        // Integral term
@@ -79,6 +82,7 @@ static const char *TAG = "motor_control";
 
 // Global setpoint variable (shared between tasks)
 static volatile int g_setpoint = 0;  // Default setpoint in ADC units (0-4095)
+
 // Control mode: true = ADC passthrough, false = manual setpoint
 static volatile bool g_use_adc = true;
 
@@ -293,15 +297,9 @@ void app_main(void)
     // Configure ADC oneshot driver for analog input
     
     adc_oneshot_unit_handle_t adc_handle;
-    adc_oneshot_unit_init_cfg_t init_cfg = {
-        .unit_id = ADC_UNIT,
-    };
+    adc_oneshot_unit_init_cfg_t init_cfg = {.unit_id = ADC_UNIT,};
     ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_cfg, &adc_handle));
-
-    adc_oneshot_chan_cfg_t chan_cfg = {
-        .bitwidth = ADC_BITWIDTH_12,
-        .atten = ADC_ATTEN,
-    };
+    adc_oneshot_chan_cfg_t chan_cfg = {.bitwidth = ADC_BITWIDTH_12,.atten = ADC_ATTEN,};
     ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, ADC_CHANNEL, &chan_cfg));
     ESP_LOGI(TAG, "ADC configured on GPIO %d", ADC_INPUT_PIN);
 
@@ -343,22 +341,22 @@ void app_main(void)
         int adc_reading = 0;
         ESP_ERROR_CHECK(adc_oneshot_read(adc_handle, ADC_CHANNEL, &adc_reading));
 
-    // Control mode: either follow ADC reading or manual setpoint from GUI
-    int setpoint_value = g_use_adc ? adc_reading : g_setpoint;
+        // Control mode: either follow ADC reading or manual setpoint from GUI
+        int setpoint_value = g_use_adc ? adc_reading : g_setpoint;
         
-    // Direct setpoint to PWM mapping (12-bit setpoint to 10-bit PWM)
-    int control_signal = (setpoint_value * MAX_PWM) / ADC_MAX;
+        // Direct setpoint to PWM mapping (12-bit setpoint to 10-bit PWM)
+        int control_signal = (setpoint_value * MAX_PWM) / ADC_MAX;
         
-    // Update motor PWM duty cycle (commanded)
-    ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, control_signal));
-    ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CHANNEL));
+        // Update motor PWM duty cycle (commanded)
+        ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, control_signal));
+        ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CHANNEL));
 
-    // Read back the actual duty from LEDC hardware (reflects GPIO6 output)
-    int pwm_duty_read = (int)ledc_get_duty(LEDC_MODE, LEDC_CHANNEL);
+        // Read back the actual duty from LEDC hardware (reflects GPIO6 output)
+        int pwm_duty_read = (int)ledc_get_duty(LEDC_MODE, LEDC_CHANNEL);
 
         // Solenoid control: HIGH if motor is on, LOW if motor is off
         int solenoid_state = 0;
-        if (pwm_duty_read > 0) {
+        if (pwm_duty_read > SECURITY_MARGIN) {
             gpio_set_level(SOLENOID_PIN, 1);
             solenoid_state = 1;
         } else {
@@ -366,22 +364,22 @@ void app_main(void)
             solenoid_state = 0;
         }
 
-    // Telemetry over UART (CSV) with security prefix: TEL,timestamp_ms,setpoint,adc_reading,control_signal,solenoid_state
-    int64_t t_us = esp_timer_get_time();
-    long long t_ms = (long long)(t_us / 1000);
-    // Telemetry reports measured PWM duty (pwm_duty_read) 
-    char telemetry[128];
-    snprintf(telemetry, sizeof(telemetry), "TEL,%lld,%d,%d,%d,%d\n", 
-             t_ms, setpoint_value, adc_reading, pwm_duty_read, solenoid_state);
-    
-    printf("%s", telemetry);
-    ESP_LOGI(TAG, "Setpoint=%d ADC=%d PWM_RD=%d SOL=%d", setpoint_value, adc_reading, pwm_duty_read, solenoid_state);
-    
-    // Send telemetry over BLE
-    send_ble_telemetry(telemetry);
+        // Telemetry over UART (CSV) with security prefix: TEL,timestamp_ms,setpoint,adc_reading,control_signal,solenoid_state
+        int64_t t_us = esp_timer_get_time();
+        long long t_ms = (long long)(t_us / 1000);
+        // Telemetry reports measured PWM duty (pwm_duty_read) 
+        char telemetry[128];
+        snprintf(telemetry, sizeof(telemetry), "TEL,%lld,%d,%d,%d,%d\n", 
+                t_ms, setpoint_value, adc_reading, pwm_duty_read, solenoid_state);
+        
+        printf("%s", telemetry);
+        ESP_LOGI(TAG, "Setpoint=%d ADC=%d PWM_RD=%d SOL=%d", setpoint_value, adc_reading, pwm_duty_read, solenoid_state);
+        
+        // Send telemetry over BLE
+        send_ble_telemetry(telemetry);
 
 
-    vTaskDelay(pdMS_TO_TICKS(10));  // 10ms = 100 Hz sample rate
+        vTaskDelay(pdMS_TO_TICKS(10));  // 10ms = 100 Hz sample rate
 
    
     }
