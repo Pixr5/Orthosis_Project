@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/ledc.h"
@@ -27,7 +28,7 @@
 #define LEDC_TIMER      LEDC_TIMER_0
 #define LEDC_MODE       LEDC_LOW_SPEED_MODE
 #define LEDC_CHANNEL    LEDC_CHANNEL_0
-#define LEDC_DUTY_RES   LEDC_TIMER_10_BIT  // 10-bit resolution (0-1023) cant go any higher at 20kHz
+#define LEDC_DUTY_RES   LEDC_TIMER_13_BIT  // 13-bit resolution (0-8191)
 #define SECURITY_MARGIN  20   // Safety margin for remanant noise after low pass filter
 
 // Solenoid control pin
@@ -39,12 +40,12 @@
 #define ADC_ATTEN       ADC_ATTEN_DB_12
 
 // Continuous ADC configuration optimized for 5Hz analog filter
-#define ADC_READ_LEN            64      // Smaller DMA buffer for lower rate
-#define ADC_CONV_FRAME_SIZE     16      // Fewer conversions per frame
-#define ADC_SAMPLE_FREQ_HZ      100     // 100Hz sampling (20x 5Hz filter)
+#define ADC_READ_LEN            256     // DMA buffer length
+#define ADC_CONV_FRAME_SIZE     64      // Conversions per frame  
+#define ADC_SAMPLE_FREQ_HZ      20000   // 20kHz sampling (minimum for continuous mode)
 
 // Motor control constants
-#define MAX_PWM        1023    // Maximum PWM duty cycle (10-bit)
+#define MAX_PWM        8191    // Maximum PWM duty cycle (13-bit)
 #define ADC_MAX        4095    // Maximum ADC value (12-bit)
 
 
@@ -55,9 +56,9 @@
 // Multi-rate control system frequencies
 #define MOTOR_CONTROL_FREQ_HZ   1000    // 1kHz for fast motor response
 #define ADC_SAMPLING_FREQ_HZ    500     // 500Hz for ADC readings
-#define TELEMETRY_FREQ_HZ       100     // 100Hz for telemetry transmission
+#define TELEMETRY_FREQ_HZ       200     // 200Hz for smoother telemetry (reduced step appearance)
 #define BLE_UPDATE_FREQ_HZ      50      // 50Hz for BLE notifications
-#define LEDC_FREQUENCY  200  // 200 Hz pwm frequency 
+#define LEDC_FREQUENCY  1000  // 1 kHz pwm frequency for smooth control
 
 // Convert to tick periods
 #define MOTOR_CONTROL_PERIOD_MS (1000 / MOTOR_CONTROL_FREQ_HZ)
@@ -82,6 +83,7 @@ typedef struct {
     int solenoid_state;
     bool new_adc_data;
     bool new_control_output;
+    bool adc_mode;  // true = ADC passthrough, false = manual setpoint
     SemaphoreHandle_t data_mutex;
 } shared_data_t;
 
@@ -166,7 +168,7 @@ static bool IRAM_ATTR s_conv_done_cb(adc_continuous_handle_t handle, const adc_c
         // Check if this is our target channel (ESP32-C3 uses type2 format)
         if (p->type2.channel == ADC_CHANNEL && p->type2.unit == ADC_UNIT) {
             uint32_t raw_data = p->type2.data;
-            if (raw_data >= 0) {  // Valid reading
+            if (raw_data > 0) {  // Valid reading
                 g_latest_adc_reading = raw_data;
                 g_adc_data_ready = true;
             }
@@ -193,6 +195,19 @@ float pi_update(pi_controller_t *pi, float current_value, float actual_dt) {
     // Calculate error
     float error = pi->setpoint - current_value;
     
+    // Deadband around zero setpoint to help PWM reach true zero
+    // Only activate deadband when setpoint is truly zero and we're very close
+    if (pi->setpoint <= 5.0f && fabs(error) < 3.0f && current_value < 10.0f) {
+        // Force output to zero when very close to zero setpoint
+        pi->integral = 0.0f;  // Reset integral to prevent windup
+        return 0.0f;
+    }
+    
+    // Integral decay for large persistent errors (runaway protection)
+    if (fabs(error) > 500.0f) {  // Large error suggests controller isn't working
+        pi->integral *= 0.95f;  // Decay integral by 5% each cycle
+    }
+    
     // Proportional term
     float p_term = pi->kp * error;
     
@@ -215,13 +230,19 @@ float pi_update(pi_controller_t *pi, float current_value, float actual_dt) {
     // Only integrate if not saturated OR if error is reducing saturation
     if (!saturated || error_reducing) {
         pi->integral += error * actual_dt;
-        
-        // Additional safety clamp for integral term
-        float max_integral = pi->output_max / pi->ki;
-        float min_integral = pi->output_min / pi->ki;
-        if (pi->integral > max_integral) pi->integral = max_integral;
-        if (pi->integral < min_integral) pi->integral = min_integral;
     }
+    
+    // Aggressive integral clamping to prevent windup
+    float max_integral = (pi->output_max * 0.8f) / pi->ki;  // 80% of max output
+    float min_integral = (pi->output_min * 0.8f) / pi->ki;  // 80% of min output
+    
+    // Also limit integral to reasonable range based on typical errors
+    float error_based_limit = fabs(pi->output_max - pi->output_min) / (2.0f * pi->ki);
+    if (max_integral > error_based_limit) max_integral = error_based_limit;
+    if (min_integral < -error_based_limit) min_integral = -error_based_limit;
+    
+    if (pi->integral > max_integral) pi->integral = max_integral;
+    if (pi->integral < min_integral) pi->integral = min_integral;
     
     // Recalculate with updated integral
     i_term = pi->ki * pi->integral;
@@ -252,6 +273,8 @@ void pi_reset(pi_controller_t *pi) {
 
 static const char *TAG = "motor_control";
 
+
+
 // High-frequency ADC sampling task using continuous ADC with DMA
 void adc_sampling_task(void *) {
     TickType_t last_wake_time = xTaskGetTickCount();
@@ -275,9 +298,12 @@ void adc_sampling_task(void *) {
             }
         }
         
-        // Calculate dynamic period
+        // Calculate dynamic period with minimum tick protection
         uint32_t period_ms = 1000 / g_freq_config.adc_sampling_hz;
-        vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(period_ms));
+        if (period_ms == 0) period_ms = 1;  // Minimum 1ms period
+        TickType_t delay_ticks = pdMS_TO_TICKS(period_ms);
+        if (delay_ticks == 0) delay_ticks = 1;  // Ensure at least 1 tick
+        vTaskDelayUntil(&last_wake_time, delay_ticks);
     }
 }
 
@@ -290,49 +316,68 @@ void motor_control_task(void *) {
     
     while (1) {
         // Get latest data (non-blocking)
+        bool use_adc_mode = false;
         if (xSemaphoreTake(g_shared_data.data_mutex, 0)) {
             if (g_shared_data.new_adc_data) {
                 local_adc = g_shared_data.adc_reading;
                 g_shared_data.new_adc_data = false;
             }
             local_setpoint = g_shared_data.setpoint_value;
+            use_adc_mode = g_shared_data.adc_mode;
             xSemaphoreGive(g_shared_data.data_mutex);
         }
         
-        // Update PI controller setpoint
-        pi_set_setpoint(&motor_pi, local_setpoint);
+        int pwm_output;
         
-        // Calculate adaptive dt for PI controller
-        uint64_t current_time_us = esp_timer_get_time();
-        float actual_dt = motor_pi.dt;  // Default to nominal
-        
-        if (motor_pi.last_update_us != 0) {
-            actual_dt = (current_time_us - motor_pi.last_update_us) / 1000000.0f;
+        if (use_adc_mode) {
+            // ADC Passthrough Mode: Direct scaling from ADC to PWM
+            // Scale ADC reading (0-4095) directly to PWM (0-8191)
+            pwm_output = (int)((local_adc / (float)ADC_MAX) * (float)MAX_PWM);
             
-            // Sanity check: clamp dt to reasonable range (0.1ms to 100ms)
-            if (actual_dt < 0.0001f) actual_dt = 0.0001f;
-            if (actual_dt > 0.1f) actual_dt = 0.1f;
+            // Clamp to valid PWM range
+            if (pwm_output < 0) pwm_output = 0;
+            if (pwm_output > MAX_PWM) pwm_output = MAX_PWM;
+            
+        } else {
+            // Manual Mode: Use PI controller
+            // Update PI controller setpoint
+            pi_set_setpoint(&motor_pi, local_setpoint);
+            
+            // Calculate adaptive dt for PI controller
+            uint64_t current_time_us = esp_timer_get_time();
+            float actual_dt = motor_pi.dt;  // Default to nominal
+            
+            if (motor_pi.last_update_us != 0) {
+                actual_dt = (current_time_us - motor_pi.last_update_us) / 1000000.0f;
+                
+                // Sanity check: clamp dt to reasonable range (0.1ms to 100ms)
+                if (actual_dt < 0.0001f) actual_dt = 0.0001f;
+                if (actual_dt > 0.1f) actual_dt = 0.1f;
+            }
+            motor_pi.last_update_us = current_time_us;
+            
+            // Calculate control output with adaptive dt
+            float control_signal = pi_update(&motor_pi, local_adc, actual_dt);
+            pwm_output = (int)control_signal;
         }
-        motor_pi.last_update_us = current_time_us;
-        
-        // Calculate control output with adaptive dt
-        float control_signal = pi_update(&motor_pi, local_adc, actual_dt);
-        int pwm_output = (int)control_signal;
         
         // Update motor PWM
         ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, pwm_output));
         ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CHANNEL));
         
-        // Store output for telemetry (use calculated value instead of reading back from hardware)
+        // Store output for telemetry 
         if (xSemaphoreTake(g_shared_data.data_mutex, pdMS_TO_TICKS(1))) {
-            g_shared_data.pwm_output = pwm_output;  // Use known value directly
+            g_shared_data.pwm_output = pwm_output;  
             g_shared_data.new_control_output = true;
             xSemaphoreGive(g_shared_data.data_mutex);
         }
         
-        // Calculate dynamic period
+        // Calculate dynamic period with minimum tick protection
         uint32_t period_ms = 1000 / g_freq_config.motor_control_hz;
-        vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(period_ms));
+        if (period_ms == 0) period_ms = 1;  // Minimum 1ms period
+        TickType_t delay_ticks = pdMS_TO_TICKS(period_ms);
+        if (delay_ticks == 0) delay_ticks = 1;  // Ensure at least 1 tick
+        vTaskDelayUntil(&last_wake_time, delay_ticks);
     }
 }
 
@@ -374,9 +419,12 @@ void telemetry_task(void *) {
         // Send via UART
         printf("%s", telemetry);
         
-        // Calculate dynamic period
+        // Calculate dynamic period with minimum tick protection
         uint32_t period_ms = 1000 / g_freq_config.telemetry_hz;
-        vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(period_ms));
+        if (period_ms == 0) period_ms = 1;  // Minimum 1ms period
+        TickType_t delay_ticks = pdMS_TO_TICKS(period_ms);
+        if (delay_ticks == 0) delay_ticks = 1;  // Ensure at least 1 tick
+        vTaskDelayUntil(&last_wake_time, delay_ticks);
     }
 }
 
@@ -409,9 +457,12 @@ void ble_update_task(void *) {
         // Send BLE telemetry
         send_ble_telemetry(ble_telemetry);
         
-        // Calculate dynamic period
+        // Calculate dynamic period with minimum tick protection
         uint32_t period_ms = 1000 / g_freq_config.ble_update_hz;
-        vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(period_ms));
+        if (period_ms == 0) period_ms = 1;  // Minimum 1ms period
+        TickType_t delay_ticks = pdMS_TO_TICKS(period_ms);
+        if (delay_ticks == 0) delay_ticks = 1;  // Ensure at least 1 tick
+        vTaskDelayUntil(&last_wake_time, delay_ticks);
     }
 }
 
@@ -558,6 +609,11 @@ void uart_read_task(void *)
                 if (new_setpoint < 0) new_setpoint = 0;
                 if (new_setpoint > ADC_MAX) new_setpoint = ADC_MAX;
                 
+                // Reset PI controller integral on significant setpoint changes
+                if (abs(new_setpoint - g_setpoint) > 100 || new_setpoint <= 10) {
+                    pi_reset(&motor_pi);
+                    ESP_LOGI(TAG, "PI reset due to setpoint change: %d -> %d", g_setpoint, new_setpoint);
+                }
                 g_setpoint = new_setpoint;
                 // Update shared data
                 if (xSemaphoreTake(g_shared_data.data_mutex, pdMS_TO_TICKS(10))) {
@@ -570,6 +626,11 @@ void uart_read_task(void *)
                 if (pct < 0) pct = 0;
                 if (pct > 100) pct = 100;
                 int new_setpoint = (pct * ADC_MAX) / 100;
+                // Reset PI controller integral on significant setpoint changes
+                if (abs(new_setpoint - g_setpoint) > 100 || new_setpoint <= 10) {
+                    pi_reset(&motor_pi);
+                    ESP_LOGI(TAG, "PI reset due to setpoint change: %d -> %d", g_setpoint, new_setpoint);
+                }
                 g_setpoint = new_setpoint;
                 // Update shared data
                 if (xSemaphoreTake(g_shared_data.data_mutex, pdMS_TO_TICKS(10))) {
@@ -582,10 +643,20 @@ void uart_read_task(void *)
                 if (strncmp(mode, "ADC", 3) == 0 || strncmp(mode, "1", 1) == 0) {
                     g_use_adc = true;
                     pi_reset(&motor_pi);  // Reset PI when switching modes
+                    // Update shared data
+                    if (xSemaphoreTake(g_shared_data.data_mutex, pdMS_TO_TICKS(10))) {
+                        g_shared_data.adc_mode = true;
+                        xSemaphoreGive(g_shared_data.data_mutex);
+                    }
                     ESP_LOGI(TAG, "Mode set to ADC passthrough");
                 } else if (strncmp(mode, "MAN", 3) == 0 || strncmp(mode, "0", 1) == 0) {
                     g_use_adc = false;
                     pi_reset(&motor_pi);  // Reset PI when switching modes
+                    // Update shared data
+                    if (xSemaphoreTake(g_shared_data.data_mutex, pdMS_TO_TICKS(10))) {
+                        g_shared_data.adc_mode = false;
+                        xSemaphoreGive(g_shared_data.data_mutex);
+                    }
                     ESP_LOGI(TAG, "Mode set to Manual setpoint");
                 }
             } else if (strncmp(line, "PI,", 3) == 0) {
@@ -685,7 +756,7 @@ void app_main(void)
     ESP_ERROR_CHECK(uart_param_config(UART_NUM, &uart_config));
     
     // Create UART read task
-    xTaskCreate(uart_read_task, "uart_read_task", 1536, NULL, 10, NULL);
+    xTaskCreate(uart_read_task, "uart_read_task", 2560, NULL, 10, NULL);
     // Configure solenoid control pin
     gpio_reset_pin(SOLENOID_PIN);
     gpio_set_direction(SOLENOID_PIN, GPIO_MODE_OUTPUT);
@@ -702,7 +773,7 @@ void app_main(void)
     adc_continuous_config_t dig_cfg = {
         .sample_freq_hz = ADC_SAMPLE_FREQ_HZ,
         .conv_mode = ADC_CONV_SINGLE_UNIT_1,
-        .format = ADC_DIGI_OUTPUT_FORMAT_TYPE1,
+        .format = ADC_DIGI_OUTPUT_FORMAT_TYPE2,
     };
     
     adc_digi_pattern_config_t adc_pattern[1] = {
@@ -773,11 +844,12 @@ void app_main(void)
     g_shared_data.solenoid_state = 0;
     g_shared_data.new_adc_data = false;
     g_shared_data.new_control_output = false;
+    g_shared_data.adc_mode = true;  // Default to ADC passthrough mode
     
-    // Initialize PI controller (no derivative for motor control)
-    // Sample time = 0.001s (1000Hz), Output range 0-1023 (10-bit PWM)
-    pi_init(&motor_pi, 1.2f, 0.05f, 0.001f, 0.0f, (float)MAX_PWM);
-    ESP_LOGI(TAG, "PI controller initialized: Kp=%.2f, Ki=%.2f (no derivative for motor control)", 
+    // Initialize PI controller with reduced Ki to prevent windup
+    // Sample time = 0.001s (1000Hz), Output range 0-8191 (13-bit PWM)
+    pi_init(&motor_pi, 1.2f, 0.02f, 0.001f, 0.0f, (float)MAX_PWM);
+    ESP_LOGI(TAG, "PI controller initialized: Kp=%.2f, Ki=%.2f ", 
              motor_pi.kp, motor_pi.ki);
 
     // Create multi-rate control tasks
@@ -787,31 +859,30 @@ void app_main(void)
     ESP_LOGI(TAG, "  - Telemetry: %d Hz", g_freq_config.telemetry_hz);
     ESP_LOGI(TAG, "  - BLE updates: %d Hz", g_freq_config.ble_update_hz);
     
-    // Create ADC sampling task (highest priority) - continuous ADC runs in background
-    xTaskCreate(adc_sampling_task, "adc_task", 1536, NULL, 
-                configMAX_PRIORITIES - 1, &adc_task_handle);
+    // Create ADC sampling task (highest priority) - continuous ADC runs in background  
+    xTaskCreate(adc_sampling_task, "adc_task", 2560, NULL, configMAX_PRIORITIES - 1, &adc_task_handle);
     
     // Create motor control task (high priority) - optimized stack for PI calculations
-    xTaskCreate(motor_control_task, "motor_task", 1792, NULL, 
-                configMAX_PRIORITIES - 2, &motor_task_handle);
+    xTaskCreate(motor_control_task, "motor_task", 1792, NULL, configMAX_PRIORITIES - 2, &motor_task_handle);
     
-    // Create telemetry task (medium priority) - optimized stack for data formatting
-    xTaskCreate(telemetry_task, "telemetry_task", 1536, NULL, 
-                configMAX_PRIORITIES - 3, &telemetry_task_handle);
+    // Create telemetry task (medium priority) - increased stack for string operations
+    xTaskCreate(telemetry_task, "telemetry_task", 3072, NULL, configMAX_PRIORITIES - 3, &telemetry_task_handle);
     
-    // Create BLE update task (low priority) - optimized stack for BLE operations
-    xTaskCreate(ble_update_task, "ble_task", 1792, NULL, 
-                configMAX_PRIORITIES - 4, &ble_task_handle);
+    // Create BLE update task (low priority) - increased stack for BLE and string operations
+    xTaskCreate(ble_update_task, "ble_task", 3072, NULL, configMAX_PRIORITIES - 4, &ble_task_handle);
     
     ESP_LOGI(TAG, "Multi-rate control system started successfully");
     
     // Main task becomes idle - just monitor system
     while (1) {
-        // Update setpoint based on mode
-        int current_setpoint = g_use_adc ? (int)g_shared_data.adc_reading : g_setpoint;
-        
+        // In manual mode, update setpoint from g_setpoint
+        // In ADC mode, motor task handles direct passthrough
+        bool adc_mode_active = false;
         if (xSemaphoreTake(g_shared_data.data_mutex, pdMS_TO_TICKS(10))) {
-            g_shared_data.setpoint_value = (float)current_setpoint;
+            adc_mode_active = g_shared_data.adc_mode;
+            if (!adc_mode_active) {
+                g_shared_data.setpoint_value = (float)g_setpoint;
+            }
             xSemaphoreGive(g_shared_data.data_mutex);
         }
         
